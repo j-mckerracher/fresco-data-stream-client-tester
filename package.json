@@ -1,0 +1,30 @@
+{
+  "name": "websockets",
+  "version": "1.0.0",
+  "description": "",
+  "main": "client.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "private": true,
+  "dependencies": {
+    "@aws-crypto/sha256-browser": "^5.2.0",
+    "@aws-sdk/client-cognito-identity": "^3.685.0",
+    "@aws-sdk/client-iot": "^3.682.0",
+    "@aws-sdk/credential-provider-cognito-identity": "^3.685.0",
+    "apache-arrow": "^18.0.0",
+    "aws-iot-device-sdk": "^2.2.15",
+    "aws-sdk": "^2.1691.0",
+    "aws-signature-v4": "^1.4.0",
+    "axios": "^1.7.7",
+    "base-64": "^1.0.0",
+    "dotenv": "^16.4.5",
+    "graphql": "^16.9.0",
+    "graphql-tag": "^2.12.6",
+    "jsonwebtoken": "^9.0.2",
+    "mqtt": "^5.10.1",
+    "node-fetch": "^2.7.0",
+    "uuid": "^11.0.2",
+    "ws": "^8.18.0"
+  }
+}
