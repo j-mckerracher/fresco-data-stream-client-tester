@@ -125,3 +125,4 @@ const startConcurrentQueries = async (numberOfConnections, sqlQuery, durationMs)
 
     console.log('--- Testing Completed ---');
 })();
+
