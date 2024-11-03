@@ -5,6 +5,7 @@ const { print } = require('graphql');
 const { v4: uuidv4 } = require('uuid');
 const { mqtt, iot } = require('aws-crt');
 const { fromEnv } = require("@aws-sdk/credential-providers");
+const crypto = require('crypto');
 
 // Load environment variables
 dotenv.config();
@@ -27,11 +28,16 @@ if (!APP_SYNC_API_URL || !APP_SYNC_API_KEY || !IOT_ENDPOINT || !IOT_TOPIC) {
 }
 
 const GET_DATA_QUERY = gql`
-  query GetData($query: String!) {
-    getData(query: $query) {
-      transferId
+    query GetData($query: String!) {
+        getData(query: $query) {
+            transferId
+            metadata {
+                rowCount
+                chunkCount
+                schema
+            }
+        }
     }
-  }
 `;
 
 class ChunkReconstructor {
@@ -40,36 +46,144 @@ class ChunkReconstructor {
         this.chunks = new Map();
         this.totalChunks = null;
         this.onComplete = onComplete;
+        this.receivedSequences = new Set();
+        this.timeoutId = null;
+        this.retryCount = new Map();
+        this.MAX_RETRIES = 3;
+        this.CHUNK_TIMEOUT = 5000;
     }
 
-    addChunk(metadata, data) {
-        if (metadata.transfer_id !== this.transferId) return false;
+    addChunk(message) {
+        try {
+            const { metadata, data } = message;
 
-        this.totalChunks = metadata.total_chunks;
-        this.chunks.set(metadata.sequence_number, data);
+            if (metadata.transfer_id !== this.transferId) {
+                return false;
+            }
 
-        return this.isComplete();
+            if (this.receivedSequences.has(metadata.sequence_number)) {
+                console.log(`Duplicate chunk received for sequence ${metadata.sequence_number}`);
+                return false;
+            }
+
+            if (!this.totalChunks) {
+                this.totalChunks = metadata.total_chunks;
+                this.startChunkTimeout();
+            }
+
+            // Verify checksum
+            const receivedChecksum = metadata.checksum;
+            const calculatedChecksum = this.createChecksum(Buffer.from(data, 'base64'));
+
+            if (receivedChecksum !== calculatedChecksum) {
+                console.error(`Checksum mismatch for chunk ${metadata.sequence_number}`);
+                this.requestChunkRetry(metadata.sequence_number);
+                return false;
+            }
+
+            this.chunks.set(metadata.sequence_number, data);
+            this.receivedSequences.add(metadata.sequence_number);
+
+            if (this.isComplete()) {
+                this.clearChunkTimeout();
+                this.processCompleteData();
+                return true;
+            }
+
+            this.restartChunkTimeout();
+            return false;
+        } catch (error) {
+            console.error('Error processing chunk:', error);
+            return false;
+        }
+    }
+
+    createChecksum(buffer) {
+        return crypto.createHash('md5').update(buffer).digest('hex');
     }
 
     isComplete() {
         if (!this.totalChunks) return false;
+        return this.receivedSequences.size === this.totalChunks;
+    }
 
+    startChunkTimeout() {
+        this.timeoutId = setTimeout(() => {
+            this.handleMissingChunks();
+        }, this.CHUNK_TIMEOUT);
+    }
+
+    clearChunkTimeout() {
+        if (this.timeoutId) {
+            clearTimeout(this.timeoutId);
+            this.timeoutId = null;
+        }
+    }
+
+    restartChunkTimeout() {
+        this.clearChunkTimeout();
+        this.startChunkTimeout();
+    }
+
+    handleMissingChunks() {
+        if (!this.totalChunks) return;
+
+        const missingChunks = [];
         for (let i = 1; i <= this.totalChunks; i++) {
-            if (!this.chunks.has(i)) return false;
+            if (!this.receivedSequences.has(i)) {
+                missingChunks.push(i);
+            }
         }
 
-        this.processCompleteData();
-        return true;
+        if (missingChunks.length > 0) {
+            console.log(`Missing chunks: ${missingChunks.join(', ')}`);
+            missingChunks.forEach(sequenceNumber => {
+                this.requestChunkRetry(sequenceNumber);
+            });
+        }
+    }
+
+    requestChunkRetry(sequenceNumber) {
+        const retries = this.retryCount.get(sequenceNumber) || 0;
+
+        if (retries >= this.MAX_RETRIES) {
+            console.error(`Max retries exceeded for chunk ${sequenceNumber}`);
+            this.handleTransferFailure();
+            return;
+        }
+
+        this.retryCount.set(sequenceNumber, retries + 1);
+        console.log(`Requesting retry for chunk ${sequenceNumber}, attempt ${retries + 1}`);
+    }
+
+    handleTransferFailure() {
+        console.error(`Transfer ${this.transferId} failed after max retries`);
+        this.onComplete(null, new Error('Transfer failed after max retries'));
+        this.cleanup();
     }
 
     processCompleteData() {
-        const orderedData = Array.from(
-            { length: this.totalChunks },
-            (_, i) => Buffer.from(this.chunks.get(i + 1), 'base64')
-        );
+        try {
+            const orderedData = Array.from(
+                { length: this.totalChunks },
+                (_, i) => Buffer.from(this.chunks.get(i + 1), 'base64')
+            );
 
-        const completeData = Buffer.concat(orderedData);
-        this.onComplete(completeData);
+            const completeData = Buffer.concat(orderedData);
+            this.onComplete(completeData, null);
+            this.cleanup();
+        } catch (error) {
+            console.error('Error processing complete data:', error);
+            this.onComplete(null, error);
+            this.cleanup();
+        }
+    }
+
+    cleanup() {
+        this.clearChunkTimeout();
+        this.chunks.clear();
+        this.receivedSequences.clear();
+        this.retryCount.clear();
     }
 }
 
@@ -77,37 +191,34 @@ class IoTClient {
     constructor() {
         this.reconstructors = new Map();
         this.connection = null;
+        this.pendingTransfers = new Set();
+        this.client = new mqtt.MqttClient();
     }
 
     async connect() {
         try {
-            // Get credentials from environment
             const credentialsProvider = fromEnv();
             const credentials = await credentialsProvider();
 
-            // Create a new config builder with WebSocket
             const builder = iot.AwsIotMqttConnectionConfigBuilder
                 .new_builder_for_websocket()
                 .with_clean_session(true)
                 .with_client_id(`test-client-${uuidv4()}`)
                 .with_endpoint(IOT_ENDPOINT)
-                .with_keep_alive_seconds(30)
-                .with_ping_timeout_ms(3000)
-                .with_protocol_operation_timeout_ms(60000)
                 .with_credentials(
                     AWS_REGION,
                     credentials.accessKeyId,
                     credentials.secretAccessKey,
                     credentials.sessionToken
-                );
+                )
+                .with_keep_alive_seconds(30);
 
             const config = builder.build();
-            const client = new mqtt.MqttClient();
-            this.connection = client.new_connection(config);
+            this.connection = this.client.new_connection(config);
 
             return new Promise((resolve, reject) => {
                 this.connection.on('connect', () => {
-                    console.log('Successfully connected to AWS IoT');
+                    console.log('Connected to AWS IoT');
                     resolve();
                 });
 
@@ -126,9 +237,9 @@ class IoTClient {
 
                 this.connection.connect();
             });
-        } catch (err) {
-            console.error('Error setting up MQTT client:', err);
-            throw err;
+        } catch (error) {
+            console.error('Failed to connect:', error);
+            throw error;
         }
     }
 
@@ -137,48 +248,55 @@ class IoTClient {
             throw new Error('Client not connected');
         }
 
-        this.reconstructors.set(transferId, new ChunkReconstructor(transferId, onComplete));
+        if (this.pendingTransfers.has(transferId)) {
+            throw new Error('Transfer ID already in use');
+        }
+
+        this.pendingTransfers.add(transferId);
+
+        const reconstructor = new ChunkReconstructor(transferId, (data, error) => {
+            this.pendingTransfers.delete(transferId);
+            onComplete(data, error);
+        });
+
+        this.reconstructors.set(transferId, reconstructor);
 
         try {
             await this.connection.subscribe(
                 IOT_TOPIC,
                 mqtt.QoS.AtLeastOnce
             );
-            console.log(`Subscribed to topic: ${IOT_TOPIC}`);
-        } catch (err) {
-            console.error('Error subscribing to topic:', err);
-            throw err;
+            console.log(`Subscribed to topic: ${IOT_TOPIC} for transfer ${transferId}`);
+        } catch (error) {
+            console.error('Subscribe error:', error);
+            this.pendingTransfers.delete(transferId);
+            this.reconstructors.delete(transferId);
+            throw error;
         }
     }
 
     handleMessage(topic, payloadBuffer) {
         try {
-            // Convert ArrayBuffer to Buffer if needed
-            const buffer = Buffer.from(payloadBuffer);
+            const message = JSON.parse(Buffer.from(payloadBuffer).toString());
 
-            // Try to parse as JSON first
-            try {
-                const message = JSON.parse(buffer.toString());
-                const { metadata, data } = message;
+            if (message.type !== 'arrow_data') {
+                console.log('Received non-arrow data message, ignoring');
+                return;
+            }
 
-                const reconstructor = this.reconstructors.get(metadata.transfer_id);
-                if (!reconstructor) {
-                    console.log(`No reconstructor found for transfer ${metadata.transfer_id}`);
-                    return;
-                }
+            const { metadata } = message;
+            const transferId = metadata.transfer_id;
 
-                if (reconstructor.addChunk(metadata, data)) {
-                    this.reconstructors.delete(metadata.transfer_id);
-                }
-            } catch (jsonError) {
-                // If JSON parsing fails, treat it as binary data
-                console.log('Received binary message, processing as Arrow data...');
+            const reconstructor = this.reconstructors.get(transferId);
+            if (!reconstructor) {
+                console.log(`No reconstructor found for transfer ${transferId}`);
+                return;
+            }
 
-                // You might want to add additional logic here to determine
-                // which transfer ID this binary data belongs to
-
-                // For now, let's log the binary data length
-                console.log(`Received binary data of length: ${buffer.length}`);
+            const isComplete = reconstructor.addChunk(message);
+            if (isComplete) {
+                this.reconstructors.delete(transferId);
+                this.pendingTransfers.delete(transferId);
             }
         } catch (error) {
             console.error('Error processing message:', error);
@@ -187,8 +305,14 @@ class IoTClient {
 
     async disconnect() {
         if (this.connection) {
-            await this.connection.disconnect();
-            this.connection = null;
+            try {
+                await this.connection.disconnect();
+                this.connection = null;
+                console.log('Disconnected from AWS IoT');
+            } catch (error) {
+                console.error('Error disconnecting:', error);
+                throw error;
+            }
         }
     }
 }
@@ -214,17 +338,20 @@ async function performGraphQLQuery(iotClient, query, queryId) {
             return;
         }
 
-        const transferId = response.data.data.getData.transferId;
-        console.log(`Query ${queryId} Success: Received Transfer ID - ${transferId}`);
+        const { transferId, metadata } = response.data.data.getData;
+        console.log(`Query ${queryId} Success: Transfer ID: ${transferId}, Expecting ${metadata.chunkCount} chunks`);
 
-        await iotClient.subscribe(transferId, (completeData) => {
-            console.log(`Received complete data for transfer ${transferId}`);
-            // Process your data here
-            // Example: console.log(completeData.toString());
+        await iotClient.subscribe(transferId, (completeData, error) => {
+            if (error) {
+                console.error(`Transfer ${transferId} failed:`, error);
+                return;
+            }
+            console.log(`Received complete data for transfer ${transferId}, size: ${completeData.length} bytes`);
         });
 
     } catch (error) {
         console.error(`Query ${queryId} Failed:`, error.message);
+        throw error;
     }
 }
 
@@ -232,30 +359,32 @@ async function startConcurrentQueries(numberOfConnections, sqlQuery, durationMs)
     console.log(`Starting ${numberOfConnections} concurrent GraphQL queries for ${durationMs} ms...`);
 
     const iotClient = new IoTClient();
-    await iotClient.connect();
-
-    const startTime = Date.now();
-    const endTime = startTime + durationMs;
-    const connectionIds = Array.from({ length: numberOfConnections }, () => uuidv4());
-
-    const queryLoop = async (connectionId) => {
-        while (Date.now() < endTime) {
-            await performGraphQLQuery(iotClient, sqlQuery, connectionId);
-            await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-        console.log(`Connection ${connectionId} finished.`);
-    };
 
     try {
+        await iotClient.connect();
+        console.log('Connected to IoT endpoint');
+
+        const startTime = Date.now();
+        const endTime = startTime + durationMs;
+        const connectionIds = Array.from({ length: numberOfConnections }, () => uuidv4());
+
+        const queryLoop = async (connectionId) => {
+            while (Date.now() < endTime) {
+                await performGraphQLQuery(iotClient, sqlQuery, connectionId);
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+            console.log(`Connection ${connectionId} finished`);
+        };
+
         await Promise.all(connectionIds.map(id => queryLoop(id)));
+    } catch (error) {
+        console.error('Error in concurrent queries:', error);
+        throw error;
     } finally {
         await iotClient.disconnect();
     }
-
-    console.log('All connections have completed their queries.');
 }
 
-// Main Execution
 (async () => {
     console.log('--- Lambda Function Tester ---');
     console.log(`AppSync API URL: ${APP_SYNC_API_URL}`);
@@ -269,10 +398,9 @@ async function startConcurrentQueries(numberOfConnections, sqlQuery, durationMs)
             SQL_QUERY,
             parseInt(CONNECTION_DURATION_MS, 10)
         );
+        console.log('--- Testing Completed Successfully ---');
     } catch (error) {
         console.error('An unexpected error occurred:', error);
         process.exit(1);
     }
-
-    console.log('--- Testing Completed ---');
 })();
