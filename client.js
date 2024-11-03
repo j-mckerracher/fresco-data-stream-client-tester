@@ -6,6 +6,8 @@ const { v4: uuidv4 } = require('uuid');
 const { mqtt, iot } = require('aws-crt');
 const { fromEnv } = require("@aws-sdk/credential-providers");
 const crypto = require('crypto');
+const fs = require('fs'); // For optional data saving
+const { RecordBatchStreamReader } = require('apache-arrow'); // Correct import
 
 // Load environment variables
 dotenv.config();
@@ -73,7 +75,8 @@ class ChunkReconstructor {
 
             // Verify checksum
             const receivedChecksum = metadata.checksum;
-            const calculatedChecksum = this.createChecksum(Buffer.from(data, 'base64'));
+            const chunkBuffer = Buffer.from(data, 'base64');
+            const calculatedChecksum = this.createChecksum(chunkBuffer);
 
             if (receivedChecksum !== calculatedChecksum) {
                 console.error(`Checksum mismatch for chunk ${metadata.sequence_number}`);
@@ -81,7 +84,7 @@ class ChunkReconstructor {
                 return false;
             }
 
-            this.chunks.set(metadata.sequence_number, data);
+            this.chunks.set(metadata.sequence_number, chunkBuffer);
             this.receivedSequences.add(metadata.sequence_number);
 
             if (this.isComplete()) {
@@ -162,11 +165,11 @@ class ChunkReconstructor {
         this.cleanup();
     }
 
-    processCompleteData() {
+    async processCompleteData() {
         try {
             const orderedData = Array.from(
                 { length: this.totalChunks },
-                (_, i) => Buffer.from(this.chunks.get(i + 1), 'base64')
+                (_, i) => this.chunks.get(i + 1)
             );
 
             const completeData = Buffer.concat(orderedData);
@@ -341,12 +344,50 @@ async function performGraphQLQuery(iotClient, query, queryId) {
         const { transferId, metadata } = response.data.data.getData;
         console.log(`Query ${queryId} Success: Transfer ID: ${transferId}, Expecting ${metadata.chunkCount} chunks`);
 
-        await iotClient.subscribe(transferId, (completeData, error) => {
+        await iotClient.subscribe(transferId, async (completeData, error) => {
             if (error) {
                 console.error(`Transfer ${transferId} failed:`, error);
                 return;
             }
             console.log(`Received complete data for transfer ${transferId}, size: ${completeData.length} bytes`);
+
+            try {
+                // Create a RecordBatchStreamReader from the Buffer
+                const reader = await RecordBatchStreamReader.from(completeData);
+
+                // Read all record batches
+                const batches = await reader.readAll();
+
+                // Process each batch and collect all records
+                const allRecords = [];
+
+                for (const batch of batches) {
+                    // Convert each batch to an array of rows
+                    const rows = batch.toArray();
+                    allRecords.push(...rows);
+                }
+
+                // Replacer function to handle BigInt serialization
+                function bigIntReplacer(key, value) {
+                    if (typeof value === 'bigint') {
+                        return value.toString();
+                    } else {
+                        return value;
+                    }
+                }
+
+                console.log(`Data for Transfer ID ${transferId}:`);
+                console.log(JSON.stringify(allRecords, bigIntReplacer, 2));
+
+            } catch (parseError) {
+                console.error(`Error parsing Arrow IPC data for transfer ${transferId}:`, parseError);
+                // Additional error details for debugging
+                console.error('Parse error details:', {
+                    message: parseError.message,
+                    stack: parseError.stack,
+                    dataSize: completeData.length
+                });
+            }
         });
 
     } catch (error) {
@@ -354,6 +395,7 @@ async function performGraphQLQuery(iotClient, query, queryId) {
         throw error;
     }
 }
+
 
 async function startConcurrentQueries(numberOfConnections, sqlQuery, durationMs) {
     console.log(`Starting ${numberOfConnections} concurrent GraphQL queries for ${durationMs} ms...`);
