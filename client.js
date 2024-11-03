@@ -1,5 +1,3 @@
-#!/usr/bin/env node
-
 const dotenv = require('dotenv');
 const axios = require('axios');
 const gql = require('graphql-tag');
@@ -153,19 +151,34 @@ class IoTClient {
         }
     }
 
-    handleMessage(topic, payload) {
+    handleMessage(topic, payloadBuffer) {
         try {
-            const message = JSON.parse(payload.toString());
-            const { metadata, data } = message;
+            // Convert ArrayBuffer to Buffer if needed
+            const buffer = Buffer.from(payloadBuffer);
 
-            const reconstructor = this.reconstructors.get(metadata.transfer_id);
-            if (!reconstructor) {
-                console.log(`No reconstructor found for transfer ${metadata.transfer_id}`);
-                return;
-            }
+            // Try to parse as JSON first
+            try {
+                const message = JSON.parse(buffer.toString());
+                const { metadata, data } = message;
 
-            if (reconstructor.addChunk(metadata, data)) {
-                this.reconstructors.delete(metadata.transfer_id);
+                const reconstructor = this.reconstructors.get(metadata.transfer_id);
+                if (!reconstructor) {
+                    console.log(`No reconstructor found for transfer ${metadata.transfer_id}`);
+                    return;
+                }
+
+                if (reconstructor.addChunk(metadata, data)) {
+                    this.reconstructors.delete(metadata.transfer_id);
+                }
+            } catch (jsonError) {
+                // If JSON parsing fails, treat it as binary data
+                console.log('Received binary message, processing as Arrow data...');
+
+                // You might want to add additional logic here to determine
+                // which transfer ID this binary data belongs to
+
+                // For now, let's log the binary data length
+                console.log(`Received binary data of length: ${buffer.length}`);
             }
         } catch (error) {
             console.error('Error processing message:', error);
