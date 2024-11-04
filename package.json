@@ -12,6 +12,7 @@
     "@aws-sdk/client-cognito-identity": "^3.685.0",
     "@aws-sdk/client-iot": "^3.682.0",
     "@aws-sdk/credential-provider-cognito-identity": "^3.685.0",
+    "@aws-sdk/credential-provider-node": "^3.682.0",
     "@aws-sdk/credential-providers": "^3.685.0",
     "apache-arrow": "^18.0.0",
     "aws-crt": "^1.23.0",
