@@ -21,11 +21,11 @@ const {
     COGNITO_IDENTITY_POOL_ID,
     APP_SYNC_API_URL,
     APP_SYNC_API_KEY,
-    SQL_QUERY = "SELECT * FROM job_data LIMIT 100",
+    SQL_QUERY = "SELECT * FROM job_data LIMIT 1000",
     IOT_ENDPOINT,
     IOT_TOPIC,
     AWS_REGION = "us-east-1",
-    SAVE_DATA = "false", // Ensure default value if not set
+    SAVE_DATA = "false",
 } = process.env;
 
 // Validate essential environment variables
@@ -56,14 +56,24 @@ class StreamingReconstructor {
         this.startTime = Date.now();
         this.schema = null;
         this.totalRows = 0;
+        this.processedSequences = new Set();
+        this.chunkBuffers = {};
 
-        // Initialize storage for chunks
-        this.chunkBuffers = {}; // { sequence_number: { chunks: [], total_chunks, received_chunks } }
+        console.log(`StreamingReconstructor initialized for transfer ${transferId}`);
 
-        // Set up timeout to handle cases where no data is received
+        // Set up timeout
         this.timeout = setTimeout(() => {
             if (!this.isFinished) {
-                this.onComplete(new Error('Timeout: No data received within the expected time.'));
+                const error = new Error('Transfer timed out');
+                error.context = {
+                    transferId: this.transferId,
+                    processedSequences: Array.from(this.processedSequences),
+                    totalRowsProcessed: this.totalRows,
+                    timeElapsed: Date.now() - this.startTime,
+                    lastProcessedSequence: Math.max(...Array.from(this.processedSequences)),
+                };
+                console.warn('Transfer timed out with context:', error.context);
+                this.onComplete(error);
                 this.isFinished = true;
             }
         }, timeoutMs);
@@ -73,10 +83,11 @@ class StreamingReconstructor {
         if (this.isFinished) return false;
 
         try {
-            const { metadata, data } = message;
+            const { metadata, data, type } = message;
+            console.log(`Processing message for sequence ${metadata.sequence_number}, chunk ${metadata.chunk_number}/${metadata.total_chunks} (is_final_sequence: ${metadata.is_final_sequence})`);
 
-            if (metadata.transfer_id !== this.transferId) {
-                console.warn(`Received message for unknown transferId: ${metadata.transfer_id}`);
+            if (type !== 'arrow_data') {
+                console.warn(`Unexpected message type: ${type}`);
                 return false;
             }
 
@@ -84,71 +95,84 @@ class StreamingReconstructor {
             const chunkNumber = metadata.chunk_number;
             const totalChunks = metadata.total_chunks;
 
-            // Initialize storage for this sequence number if not already done
+            // Initialize storage for this sequence if needed
             if (!this.chunkBuffers[sequenceNumber]) {
                 this.chunkBuffers[sequenceNumber] = {
-                    chunks: [],
+                    chunks: new Array(totalChunks),
                     totalChunks,
                     receivedChunks: 0,
                 };
             }
 
             const bufferInfo = this.chunkBuffers[sequenceNumber];
-            bufferInfo.chunks[chunkNumber - 1] = data; // Store chunk in the correct order (zero-based index)
-            bufferInfo.receivedChunks++;
 
-            console.log(`Received chunk ${chunkNumber}/${totalChunks} for sequence ${sequenceNumber}`);
+            // Store the chunk if we haven't stored it before
+            if (!bufferInfo.chunks[chunkNumber - 1]) {
+                bufferInfo.chunks[chunkNumber - 1] = data;
+                bufferInfo.receivedChunks++;
+                console.log(`Stored chunk ${chunkNumber}/${totalChunks} for sequence ${sequenceNumber}`);
+            }
 
-            // Check if all chunks have been received
-            if (bufferInfo.receivedChunks === totalChunks) {
-                // Reassemble the complete data
-                const completeData = bufferInfo.chunks.join(''); // Concatenate base64 strings
+            // Process the sequence if all chunks are received
+            if (bufferInfo.receivedChunks === bufferInfo.totalChunks &&
+                !this.processedSequences.has(sequenceNumber)) {
 
-                // Deserialize the Arrow Stream IPC data
-                const buffer = Buffer.from(completeData, 'base64');
+                console.log(`Processing complete sequence ${sequenceNumber}`);
+                await this.processCompleteSequence(sequenceNumber, metadata);
 
-                try {
-                    const reader = await RecordBatchStreamReader.from(buffer);
-                    const batches = await reader.readAll();
+                // Clean up the processed sequence
+                delete this.chunkBuffers[sequenceNumber];
+                this.processedSequences.add(sequenceNumber);
 
-                    if (!this.schema && batches.length > 0) {
-                        this.schema = batches[0].schema;
-                    }
-
-                    for (const batch of batches) {
-                        const rows = batch.toArray();
-                        this.totalRows += rows.length;
-
-                        this.onDataBatch({
-                            rows,
-                            metadata: {
-                                sequence: sequenceNumber,
-                                timestamp: metadata.timestamp,
-                                processingTime: Date.now() - this.startTime
-                            }
-                        });
-                    }
-
-                    // Clean up the buffer for this sequence number
-                    delete this.chunkBuffers[sequenceNumber];
-
-                    // Check if this was the final sequence
-                    if (metadata.is_final_sequence) {
-                        await this.complete();
-                        return true;
-                    }
-
-                } catch (error) {
-                    console.error('Error processing Arrow data:', error);
-                    throw error;
+                // If this was the final sequence, complete the transfer
+                if (metadata.is_final_sequence === true) {
+                    console.log('Final sequence detected, completing transfer');
+                    await this.complete();
+                    return true;
                 }
             }
 
             return false;
         } catch (error) {
-            console.error('Error in processMessage:', error);
-            this.onComplete(new Error(`Failed to process message: ${error.message}`));
+            console.error('Error processing message:', error);
+            console.error('Message:', JSON.stringify(message, null, 2));
+            this.onComplete(error);
             return false;
+        }
+    }
+
+    async processCompleteSequence(sequenceNumber, metadata) {
+        const bufferInfo = this.chunkBuffers[sequenceNumber];
+        const completeData = bufferInfo.chunks.join('');
+        const buffer = Buffer.from(completeData, 'base64');
+
+        try {
+            const reader = await RecordBatchStreamReader.from(buffer);
+            const batches = await reader.readAll();
+
+            if (!this.schema && batches.length > 0) {
+                this.schema = batches[0].schema;
+            }
+
+            for (const batch of batches) {
+                const rows = batch.toArray();
+                this.totalRows += rows.length;
+
+                this.onDataBatch({
+                    rows,
+                    metadata: {
+                        sequence: sequenceNumber,
+                        timestamp: metadata.timestamp,
+                        processingTime: Date.now() - this.startTime
+                    }
+                });
+            }
+
+            console.log(`Processed ${batches.length} batches from sequence ${sequenceNumber}`);
+        } catch (error) {
+            console.error('Error processing Arrow data:', error);
+            console.error('Buffer info:', bufferInfo);
+            throw error;
         }
     }
 
@@ -156,14 +180,16 @@ class StreamingReconstructor {
         if (this.isFinished) return;
 
         this.isFinished = true;
-        clearTimeout(this.timeout); // Clear timeout upon completion
+        clearTimeout(this.timeout);
 
         const processingTime = Date.now() - this.startTime;
+        console.log(`Transfer completed. Processed ${this.totalRows} rows in ${processingTime}ms`);
 
         this.onComplete(null, {
             transferId: this.transferId,
             totalRows: this.totalRows,
             processingTime,
+            processedSequences: Array.from(this.processedSequences),
             schema: this.schema?.fields.map(f => ({
                 name: f.name,
                 type: f.type.toString()
@@ -177,29 +203,23 @@ class IoTClientWrapper {
         this.streamingReconstructors = new Map();
         this.connection = null;
         this.client = new mqtt.MqttClient();
-        this.currentTransferId = null; // Track current transferId
     }
 
     async connect() {
         try {
-            // Initialize Cognito Identity Client
             const cognitoClient = new CognitoIdentityClient({ region: AWS_REGION });
-
-            // Get Cognito Identity ID
             const getIdCommand = new GetIdCommand({
                 IdentityPoolId: COGNITO_IDENTITY_POOL_ID,
             });
             const { IdentityId } = await cognitoClient.send(getIdCommand);
             console.log("Cognito Identity ID:", IdentityId);
 
-            // Get AWS Credentials
             const getCredentialsCommand = new GetCredentialsForIdentityCommand({
                 IdentityId,
             });
             const credentialsResponse = await cognitoClient.send(getCredentialsCommand);
             const rawCredentials = credentialsResponse.Credentials;
 
-            // Map credentials to the expected format
             const credentials = {
                 accessKeyId: rawCredentials.AccessKeyId,
                 secretAccessKey: rawCredentials.SecretKey,
@@ -207,22 +227,17 @@ class IoTClientWrapper {
                 expiration: rawCredentials.Expiration ? new Date(rawCredentials.Expiration * 1000) : undefined,
             };
 
-            // Attach AWS IoT policy to the identity
             const iotClient = new IoTClient({ region: AWS_REGION, credentials });
-
             const attachPolicyCommand = new AttachPolicyCommand({
-                policyName: "DataStreamingIoTPolicy", // Must match the name in aws_iot_policy
+                policyName: "DataStreamingIoTPolicy",
                 target: IdentityId,
             });
             await iotClient.send(attachPolicyCommand);
             console.log("AWS IoT policy attached to identity");
 
-            // Use the Cognito Identity ID as the MQTT client ID
-            const clientId = IdentityId;
-
             const builder = iot.AwsIotMqttConnectionConfigBuilder.new_with_websockets()
                 .with_clean_session(true)
-                .with_client_id(clientId)
+                .with_client_id(IdentityId)
                 .with_endpoint(IOT_ENDPOINT)
                 .with_credentials(
                     AWS_REGION,
@@ -262,14 +277,12 @@ class IoTClientWrapper {
         }
     }
 
-
-
     async subscribe(transferId, onDataBatch, onComplete) {
         if (!this.connection) {
             throw new Error('Client not connected');
         }
 
-        this.currentTransferId = transferId; // Set current transferId
+        console.log(`Setting up subscription for transfer ${transferId}`);
 
         const reconstructor = new StreamingReconstructor(
             transferId,
@@ -284,7 +297,7 @@ class IoTClientWrapper {
                 IOT_TOPIC,
                 mqtt.QoS.AtLeastOnce
             );
-            console.log(`Subscribed to topic: ${IOT_TOPIC} for transfer ${transferId}`);
+            console.log(`Subscribed to topic: ${IOT_TOPIC}`);
         } catch (error) {
             console.error('Subscribe error:', error);
             this.streamingReconstructors.delete(transferId);
@@ -294,27 +307,35 @@ class IoTClientWrapper {
 
     async handleMessage(topic, payloadBuffer) {
         try {
-            const message = JSON.parse(Buffer.from(payloadBuffer).toString());
-            console.log(`Received message on topic ${topic}:`, message.metadata);
+            // Convert ArrayBuffer to string properly
+            let payload;
+            if (payloadBuffer instanceof ArrayBuffer) {
+                payload = new TextDecoder().decode(payloadBuffer);
+            } else if (Buffer.isBuffer(payloadBuffer)) {
+                payload = payloadBuffer.toString();
+            } else {
+                payload = payloadBuffer.toString();
+            }
 
-            if (!message || !message.metadata || !message.metadata.transfer_id) {
-                console.warn('Received invalid message format');
+            const message = JSON.parse(payload);
+
+            if (!message || !message.metadata) {
+                console.warn('Received invalid message format:', message);
                 return;
             }
 
-            const reconstructor = this.streamingReconstructors.get(message.metadata.transfer_id);
-            if (!reconstructor) {
-                console.warn(`No reconstructor found for transfer ID: ${message.metadata.transfer_id}`);
-                return;
-            }
+            console.log(`Received message for sequence ${message.metadata.sequence_number}`);
 
-            await reconstructor.processMessage(message);
+            // Process message with all active reconstructors
+            for (const reconstructor of this.streamingReconstructors.values()) {
+                await reconstructor.processMessage(message);
+            }
         } catch (error) {
-            console.error('Error processing message:', error);
+            console.error('Error handling message:', error);
+            console.error('Raw payload:', payloadBuffer);
         }
     }
 
-    // Add debugging method
     async testConnection() {
         if (!this.connection) {
             throw new Error('Not connected');
@@ -349,44 +370,47 @@ class IoTClientWrapper {
 
 async function performStreamingQuery(iotClient, query, queryId) {
     try {
-        // Generate transfer ID early
         const transferId = uuidv4();
+        console.log(`Starting query execution with transfer ID: ${transferId}`);
 
-        // Subscribe BEFORE making the GraphQL query
-        console.log(`Setting up subscription for transfer ${transferId}...`);
-        await iotClient.subscribe(
-            transferId,
-            (batchData) => {
-                console.log(`Received batch data for sequence ${batchData.metadata.sequence}`);
-                console.log('Batch data:', batchData.rows);
+        // Set up data reception promise
+        const dataReceptionPromise = new Promise((resolve, reject) => {
+            const batchHandler = (batchData) => {
+                console.log(`Received batch with ${batchData.rows.length} rows for sequence ${batchData.metadata.sequence}`);
 
-                // Save data if enabled
-                if (process.env.SAVE_DATA === 'true') {
+                if (SAVE_DATA === 'true') {
                     const filename = `data_${transferId}_batch_${batchData.metadata.sequence}.json`;
                     fs.writeFileSync(filename, JSON.stringify(batchData.rows, null, 2));
-                    console.log(`Data saved to ${filename}`);
+                    console.log(`Saved batch to ${filename}`);
                 }
-            },
-            (error, stats) => {
-                if (error) {
-                    console.error(`Query ${queryId} failed:`, error);
-                    return;
-                }
-                console.log(`Query ${queryId} completed:`, stats);
-            }
-        );
+            };
 
-        // Wait a moment to ensure subscription is ready
+            const completionHandler = (error, stats) => {
+                if (error) {
+                    console.error(`Transfer failed:`, error);
+                    reject(error);
+                } else {
+                    console.log(`Transfer completed:`, stats);
+                    resolve(stats);
+                }
+            };
+
+            iotClient.subscribe(transferId, batchHandler, completionHandler)
+                .catch(reject);
+        });
+
+        // Wait for subscription to be ready
         await new Promise(resolve => setTimeout(resolve, 1000));
 
+        // Execute GraphQL query
         const variables = {
             query,
-            rowLimit: 100,
+            rowLimit: 100000,
             batchSize: 100,
-            transferId // Include transferId in variables
+            transferId
         };
 
-        console.log('Sending GraphQL query with variables:', variables);
+        console.log('Executing GraphQL query with variables:', variables);
 
         const response = await axios.post(
             APP_SYNC_API_URL,
@@ -403,61 +427,38 @@ async function performStreamingQuery(iotClient, query, queryId) {
         );
 
         if (response.data.errors) {
-            console.error(`Query ${queryId} GraphQL Errors:`, response.data.errors);
-            throw new Error('GraphQL query failed.');
+            throw new Error(`GraphQL query failed: ${JSON.stringify(response.data.errors)}`);
         }
 
-        console.log(`GraphQL query response:`, response.data);
+        console.log('Query initiated successfully, waiting for data...');
 
-        // Return a Promise that resolves when the data transfer is complete
-        return new Promise((resolve, reject) => {
-            // We've already set up the subscription, just need to wait for completion
-            const timeout = setTimeout(() => {
-                reject(new Error('Query timed out'));
-            }, 120000); // 2 minute timeout
+        // Wait for data reception to complete
+        const result = await dataReceptionPromise;
+        return result;
 
-            const reconstructor = iotClient.streamingReconstructors.get(transferId);
-            if (!reconstructor) {
-                clearTimeout(timeout);
-                reject(new Error(`No reconstructor found for transfer ID: ${transferId}`));
-                return;
-            }
-
-            reconstructor.onComplete = (error, stats) => {
-                clearTimeout(timeout);
-                if (error) {
-                    reject(error);
-                } else {
-                    resolve(stats);
-                }
-            };
-        });
     } catch (error) {
         console.error(`Query ${queryId} failed:`, error);
         throw error;
     }
 }
 
-
 async function startSingleQuery(sqlQuery) {
-    console.log(`\n--- Starting a streaming query ---`);
-
+    console.log(`\n--- Starting streaming query ---`);
     const iotClient = new IoTClientWrapper();
 
     try {
         await iotClient.connect();
         console.log('Connected to IoT endpoint');
 
-        // Test connection
         await iotClient.testConnection();
         console.log('Connection test successful');
 
         const queryId = 'single-query';
         const result = await performStreamingQuery(iotClient, sqlQuery, queryId);
-        console.log('Query completed successfully:', result);
+        console.log(`Query completed successfully:`, result);
 
     } catch (error) {
-        console.error('Error in single query:', error);
+        console.error('Error in query execution:', error);
         throw error;
     } finally {
         try {
@@ -469,7 +470,6 @@ async function startSingleQuery(sqlQuery) {
     }
 }
 
-
 (async () => {
     console.log('--- Streaming Lambda Tester ---');
     console.log(`AppSync API URL: ${APP_SYNC_API_URL}`);
@@ -479,6 +479,7 @@ async function startSingleQuery(sqlQuery) {
     try {
         await startSingleQuery(SQL_QUERY);
         console.log('\n--- Testing Completed Successfully ---');
+        process.exit(0);
     } catch (error) {
         console.error('Testing failed:', error);
         process.exit(1);
