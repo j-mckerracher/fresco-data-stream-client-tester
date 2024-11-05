@@ -16,7 +16,7 @@ const {
     APP_SYNC_API_URL,
     APP_SYNC_API_KEY,
     NUMBER_OF_CONNECTIONS = '6',
-    SQL_QUERY = 'SELECT * FROM job_data',
+    SQL_QUERY = 'SELECT * FROM job_data LIMIT 100',
     CONNECTION_DURATION_MS = '60000',
     IOT_ENDPOINT,
     IOT_TOPIC,
@@ -337,51 +337,53 @@ async function performGraphQLQuery(iotClient, query, queryId) {
         );
 
         if (response.data.errors) {
-            console.error(`Query ${queryId} Errors:`, JSON.stringify(response.data.errors, null, 2));
+            console.error(`Query ${queryId} GraphQL Errors:`, JSON.stringify(response.data.errors, null, 2));
             return;
         }
 
-        const { transferId, metadata } = response.data.data.getData;
+        const result = response.data.data.getData;
+
+        if (!result || !result.transferId || !result.metadata) {
+            console.error(`Query ${queryId} Error: Invalid response structure`, result);
+            return;
+        }
+
+        const { transferId, metadata } = result;
+
         console.log(`Query ${queryId} Success: Transfer ID: ${transferId}, Expecting ${metadata.chunkCount} chunks`);
+        console.log(`Schema information:`, metadata.schema);
 
         await iotClient.subscribe(transferId, async (completeData, error) => {
             if (error) {
                 console.error(`Transfer ${transferId} failed:`, error);
                 return;
             }
-            console.log(`Received complete data for transfer ${transferId}, size: ${completeData.length} bytes`);
 
             try {
+                console.log(`Received complete data for transfer ${transferId}, size: ${completeData.length} bytes`);
+
                 // Create a RecordBatchStreamReader from the Buffer
                 const reader = await RecordBatchStreamReader.from(completeData);
-
-                // Read all record batches
                 const batches = await reader.readAll();
 
                 // Process each batch and collect all records
                 const allRecords = [];
-
                 for (const batch of batches) {
-                    // Convert each batch to an array of rows
                     const rows = batch.toArray();
                     allRecords.push(...rows);
                 }
 
-                // Replacer function to handle BigInt serialization
-                function bigIntReplacer(key, value) {
-                    if (typeof value === 'bigint') {
-                        return value.toString();
-                    } else {
-                        return value;
-                    }
-                }
+                console.log(`Successfully processed ${allRecords.length} records for transfer ${transferId}`);
 
-                console.log(`Data for Transfer ID ${transferId}:`);
-                console.log(JSON.stringify(allRecords, bigIntReplacer, 2));
+                // Optional: Save or process the data further
+                if (process.env.SAVE_DATA === 'true') {
+                    const filename = `data_${transferId}.json`;
+                    fs.writeFileSync(filename, JSON.stringify(allRecords, bigIntReplacer, 2));
+                    console.log(`Data saved to ${filename}`);
+                }
 
             } catch (parseError) {
                 console.error(`Error parsing Arrow IPC data for transfer ${transferId}:`, parseError);
-                // Additional error details for debugging
                 console.error('Parse error details:', {
                     message: parseError.message,
                     stack: parseError.stack,
@@ -391,9 +393,21 @@ async function performGraphQLQuery(iotClient, query, queryId) {
         });
 
     } catch (error) {
-        console.error(`Query ${queryId} Failed:`, error.message);
+        console.error(`Query ${queryId} Request Failed:`, error.message);
+        if (error.response) {
+            console.error('Response data:', error.response.data);
+            console.error('Response status:', error.response.status);
+        }
         throw error;
     }
+}
+
+// Helper function for JSON serialization of BigInt values
+function bigIntReplacer(key, value) {
+    if (typeof value === 'bigint') {
+        return value.toString();
+    }
+    return value;
 }
 
 
