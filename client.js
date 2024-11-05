@@ -14,12 +14,11 @@ dotenv.config();
 const {
     APP_SYNC_API_URL,
     APP_SYNC_API_KEY,
-    NUMBER_OF_CONNECTIONS = '6',
     SQL_QUERY = 'SELECT * FROM job_data LIMIT 100',
-    CONNECTION_DURATION_MS = '60000',
     IOT_ENDPOINT,
     IOT_TOPIC,
-    AWS_REGION = 'us-east-1'
+    AWS_REGION = 'us-east-1',
+    SAVE_DATA = 'false' // Ensure default value if not set
 } = process.env;
 
 // Validate essential environment variables
@@ -42,23 +41,34 @@ const GET_DATA_QUERY = gql`
 `;
 
 class StreamingReconstructor {
-    constructor(transferId, onDataBatch, onComplete) {
+    constructor(transferId, onDataBatch, onComplete, timeoutMs = 30000) { // Added timeoutMs
         this.transferId = transferId;
         this.onDataBatch = onDataBatch;
         this.onComplete = onComplete;
-        this.receivedSequences = new Map(); // Changed to Map to store chunks
+        this.receivedSequences = new Map();
         this.lastProcessedSequence = 0;
         this.isFinished = false;
         this.startTime = Date.now();
         this.schema = null;
         this.totalRows = 0;
+
+        // Set up timeout to handle cases where no data is received
+        this.timeout = setTimeout(() => {
+            if (!this.isFinished) {
+                this.onComplete(new Error('Timeout: No data received within the expected time.'));
+                this.isFinished = true;
+            }
+        }, timeoutMs);
     }
 
     async processChunk(message) {
+        if (this.isFinished) return false;
+
         try {
             const { metadata, data } = message;
 
             if (metadata.transfer_id !== this.transferId) {
+                console.warn(`Received message for unknown transferId: ${metadata.transfer_id}`);
                 return false;
             }
 
@@ -71,7 +81,7 @@ class StreamingReconstructor {
             chunks.set(metadata.chunk_number, Buffer.from(data, 'base64'));
 
             // Check if we have all chunks for this sequence
-            if (chunks.size === metadata.total_chunks) {
+            if (chunks.size === metadata.chunkCount) { // Ensure chunkCount matches
                 // Combine chunks in order
                 const orderedChunks = Array.from(chunks.entries())
                     .sort(([a], [b]) => a - b)
@@ -104,7 +114,7 @@ class StreamingReconstructor {
                     this.receivedSequences.delete(sequenceKey);
 
                     // Check if this was the final sequence
-                    if (metadata.sequence_number === metadata.total_chunks) {
+                    if (metadata.sequence_number === metadata.chunkCount) {
                         await this.complete();
                         return true;
                     }
@@ -122,11 +132,12 @@ class StreamingReconstructor {
         }
     }
 
-
     async complete() {
         if (this.isFinished) return;
 
         this.isFinished = true;
+        clearTimeout(this.timeout); // Clear timeout upon completion
+
         const processingTime = Date.now() - this.startTime;
 
         this.onComplete(null, {
@@ -146,6 +157,7 @@ class IoTClient {
         this.streamingReconstructors = new Map();
         this.connection = null;
         this.client = new mqtt.MqttClient();
+        this.currentTransferId = null; // Track current transferId
     }
 
     async connect() {
@@ -201,6 +213,8 @@ class IoTClient {
             throw new Error('Client not connected');
         }
 
+        this.currentTransferId = transferId; // Set current transferId
+
         const reconstructor = new StreamingReconstructor(
             transferId,
             onDataBatch,
@@ -226,12 +240,20 @@ class IoTClient {
         try {
             const message = JSON.parse(Buffer.from(payloadBuffer).toString());
 
+            console.log(`\n--- Received Message on Topic ${topic} ---`);
+            console.log(JSON.stringify(message, null, 2));
+
             if (message.type !== 'arrow_data') {
                 return;
             }
 
             const { metadata } = message;
             const transferId = metadata.transfer_id;
+
+            if (transferId !== this.currentTransferId) {
+                console.warn(`Received message for unknown transferId: ${transferId}`);
+                return;
+            }
 
             const reconstructor = this.streamingReconstructors.get(transferId);
             if (!reconstructor) {
@@ -283,10 +305,21 @@ async function performStreamingQuery(iotClient, query, queryId) {
         }
 
         const result = response.data.data.getData;
+        console.log(`\n--- Query Response ---`);
+        console.log(JSON.stringify(result, null, 2));
+
         const { transferId, metadata } = result;
 
-        console.log(`Query ${queryId} initiated: Transfer ID: ${transferId}`);
+        console.log(`\n--- Query ${queryId} initiated ---`);
+        console.log(`Transfer ID: ${transferId}`);
         console.log(`Schema information:`, metadata.schema);
+        console.log(`Row Count: ${metadata.rowCount}`);
+        console.log(`Chunk Count: ${metadata.chunkCount}`);
+
+        if (metadata.chunkCount <= 0) {
+            console.error('No data to process. Exiting.');
+            return;
+        }
 
         let batchCount = 0;
         let rowCount = 0;
@@ -298,16 +331,23 @@ async function performStreamingQuery(iotClient, query, queryId) {
                 batchCount++;
                 rowCount += batchData.rows.length;
 
-                console.log(`Query ${queryId} - Received batch ${batchCount}:`, {
-                    sequence: batchData.metadata.sequence,
-                    rows: batchData.rows.length,
-                    processingTime: batchData.metadata.processingTime
-                });
+                console.log(`\n--- Query ${queryId} - Received batch ${batchCount} ---`);
+                console.log(`Sequence: ${batchData.metadata.sequence}`);
+                console.log(`Rows in this batch: ${batchData.rows.length}`);
+                console.log(`Processing Time: ${batchData.metadata.processingTime} ms`);
+
+                // **Print the data rows in a human-readable format**
+                // Option 1: Using console.table (best for small to medium-sized data)
+                console.table(batchData.rows);
+
+                // Option 2: Using JSON.stringify for larger or more complex data
+                // console.log(JSON.stringify(batchData.rows, null, 2));
 
                 // Optional: Save each batch to a file
-                if (process.env.SAVE_DATA === 'true') {
+                if (SAVE_DATA === 'true') {
                     const filename = `data_${transferId}_batch_${batchCount}.json`;
                     fs.writeFileSync(filename, JSON.stringify(batchData.rows, null, 2));
+                    console.log(`Data saved to ${filename}`);
                 }
             },
             // Completion handler
@@ -317,7 +357,8 @@ async function performStreamingQuery(iotClient, query, queryId) {
                     return;
                 }
 
-                console.log(`Query ${queryId} completed:`, {
+                console.log(`\n--- Query ${queryId} completed ---`);
+                console.log({
                     transferId: stats.transferId,
                     totalBatches: batchCount,
                     totalRows: stats.totalRows,
@@ -333,8 +374,8 @@ async function performStreamingQuery(iotClient, query, queryId) {
     }
 }
 
-async function startConcurrentQueries(numberOfConnections, sqlQuery, durationMs) {
-    console.log(`Starting ${numberOfConnections} concurrent streaming queries for ${durationMs} ms...`);
+async function startSingleQuery(sqlQuery) {
+    console.log(`\n--- Starting a single streaming query ---`);
 
     const iotClient = new IoTClient();
 
@@ -342,21 +383,11 @@ async function startConcurrentQueries(numberOfConnections, sqlQuery, durationMs)
         await iotClient.connect();
         console.log('Connected to IoT endpoint');
 
-        const startTime = Date.now();
-        const endTime = startTime + durationMs;
-        const connectionIds = Array.from({ length: numberOfConnections }, () => uuidv4());
+        const queryId = 'single-query'; // Identifier for logging
 
-        const queryLoop = async (connectionId) => {
-            while (Date.now() < endTime) {
-                await performStreamingQuery(iotClient, sqlQuery, connectionId);
-                await new Promise(resolve => setTimeout(resolve, 1000));
-            }
-            console.log(`Connection ${connectionId} finished`);
-        };
-
-        await Promise.all(connectionIds.map(id => queryLoop(id)));
+        await performStreamingQuery(iotClient, sqlQuery, queryId);
     } catch (error) {
-        console.error('Error in concurrent queries:', error);
+        console.error('Error in single query:', error);
         throw error;
     } finally {
         await iotClient.disconnect();
@@ -366,17 +397,13 @@ async function startConcurrentQueries(numberOfConnections, sqlQuery, durationMs)
 (async () => {
     console.log('--- Streaming Lambda Tester ---');
     console.log(`AppSync API URL: ${APP_SYNC_API_URL}`);
-    console.log(`Number of Connections: ${NUMBER_OF_CONNECTIONS}`);
     console.log(`SQL Query: ${SQL_QUERY}`);
-    console.log(`Connection Duration: ${CONNECTION_DURATION_MS} ms\n`);
+    // Removed Number of Connections and Connection Duration as they're no longer applicable
+    console.log(`Save Data: ${SAVE_DATA === 'true' ? 'Enabled' : 'Disabled'}\n`);
 
     try {
-        await startConcurrentQueries(
-            parseInt(NUMBER_OF_CONNECTIONS, 10),
-            SQL_QUERY,
-            parseInt(CONNECTION_DURATION_MS, 10)
-        );
-        console.log('--- Testing Completed Successfully ---');
+        await startSingleQuery(SQL_QUERY);
+        console.log('\n--- Testing Completed Successfully ---');
     } catch (error) {
         console.error('Testing failed:', error);
         process.exit(1);
