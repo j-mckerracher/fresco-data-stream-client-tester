@@ -35,8 +35,8 @@ if (!APP_SYNC_API_URL || !APP_SYNC_API_KEY || !IOT_ENDPOINT || !IOT_TOPIC || !CO
 }
 
 const GET_DATA_QUERY = gql`
-    query GetData($query: String!, $rowLimit: Int, $batchSize: Int) {
-        getData(query: $query, rowLimit: $rowLimit, batchSize: $batchSize) {
+    query GetData($query: String!, $rowLimit: Int, $batchSize: Int, $transferId: String!) {
+        getData(query: $query, rowLimit: $rowLimit, batchSize: $batchSize, transferId: $transferId) {
             transferId
             metadata {
                 rowCount
@@ -48,7 +48,7 @@ const GET_DATA_QUERY = gql`
 `;
 
 class StreamingReconstructor {
-    constructor(transferId, onDataBatch, onComplete, timeoutMs = 30000) {
+    constructor(transferId, onDataBatch, onComplete, timeoutMs = 120000) {
         this.transferId = transferId;
         this.onDataBatch = onDataBatch;
         this.onComplete = onComplete;
@@ -295,34 +295,41 @@ class IoTClientWrapper {
     async handleMessage(topic, payloadBuffer) {
         try {
             const message = JSON.parse(Buffer.from(payloadBuffer).toString());
+            console.log(`Received message on topic ${topic}:`, message.metadata);
 
-            console.log(`\n--- Received Message on Topic ${topic} ---`);
-            console.log(`Raw payload: ${payloadBuffer.toString()}`);
-            console.log(JSON.stringify(message.metadata, null, 2));
-
-            if (message.type !== 'arrow_data') {
+            if (!message || !message.metadata || !message.metadata.transfer_id) {
+                console.warn('Received invalid message format');
                 return;
             }
 
-            const { metadata } = message;
-            const transferId = metadata.transfer_id;
-
-            if (transferId !== this.currentTransferId) {
-                console.warn(`Received message for unknown transferId: ${transferId}`);
-                return;
-            }
-
-            const reconstructor = this.streamingReconstructors.get(transferId);
+            const reconstructor = this.streamingReconstructors.get(message.metadata.transfer_id);
             if (!reconstructor) {
+                console.warn(`No reconstructor found for transfer ID: ${message.metadata.transfer_id}`);
                 return;
             }
 
-            const isComplete = await reconstructor.processMessage(message);
-            if (isComplete) {
-                this.streamingReconstructors.delete(transferId);
-            }
+            await reconstructor.processMessage(message);
         } catch (error) {
             console.error('Error processing message:', error);
+        }
+    }
+
+    // Add debugging method
+    async testConnection() {
+        if (!this.connection) {
+            throw new Error('Not connected');
+        }
+
+        try {
+            await this.connection.publish(
+                IOT_TOPIC,
+                JSON.stringify({ test: 'connectivity' }),
+                mqtt.QoS.AtLeastOnce
+            );
+            console.log('Test message published successfully');
+        } catch (error) {
+            console.error('Failed to publish test message:', error);
+            throw error;
         }
     }
 
@@ -342,11 +349,44 @@ class IoTClientWrapper {
 
 async function performStreamingQuery(iotClient, query, queryId) {
     try {
+        // Generate transfer ID early
+        const transferId = uuidv4();
+
+        // Subscribe BEFORE making the GraphQL query
+        console.log(`Setting up subscription for transfer ${transferId}...`);
+        await iotClient.subscribe(
+            transferId,
+            (batchData) => {
+                console.log(`Received batch data for sequence ${batchData.metadata.sequence}`);
+                console.log('Batch data:', batchData.rows);
+
+                // Save data if enabled
+                if (process.env.SAVE_DATA === 'true') {
+                    const filename = `data_${transferId}_batch_${batchData.metadata.sequence}.json`;
+                    fs.writeFileSync(filename, JSON.stringify(batchData.rows, null, 2));
+                    console.log(`Data saved to ${filename}`);
+                }
+            },
+            (error, stats) => {
+                if (error) {
+                    console.error(`Query ${queryId} failed:`, error);
+                    return;
+                }
+                console.log(`Query ${queryId} completed:`, stats);
+            }
+        );
+
+        // Wait a moment to ensure subscription is ready
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
         const variables = {
             query,
             rowLimit: 100,
-            batchSize: 100
+            batchSize: 100,
+            transferId // Include transferId in variables
         };
+
+        console.log('Sending GraphQL query with variables:', variables);
 
         const response = await axios.post(
             APP_SYNC_API_URL,
@@ -367,70 +407,30 @@ async function performStreamingQuery(iotClient, query, queryId) {
             throw new Error('GraphQL query failed.');
         }
 
-        const result = response.data.data.getData;
-        console.log(`\n--- Query Response ---`);
-        console.log(JSON.stringify(result, null, 2));
-
-        const { transferId, metadata } = result;
-
-        console.log(`\n--- Query ${queryId} initiated ---`);
-        console.log(`Transfer ID: ${transferId}`);
-        console.log(`Schema information:`, metadata.schema);
-        console.log(`Row Count: ${metadata.rowCount}`);
-        console.log(`Chunk Count: ${metadata.chunkCount}`);
-
-        if (metadata.rowCount <= 0) {
-            console.error('No data to process. Exiting.');
-            return;
-        }
-
-        let batchCount = 0;
-        let rowCount = 0;
+        console.log(`GraphQL query response:`, response.data);
 
         // Return a Promise that resolves when the data transfer is complete
-        return new Promise(async (resolve, reject) => {
-            await iotClient.subscribe(
-                transferId,
-                // Batch handler
-                (batchData) => {
-                    batchCount++;
-                    rowCount += batchData.rows.length;
+        return new Promise((resolve, reject) => {
+            // We've already set up the subscription, just need to wait for completion
+            const timeout = setTimeout(() => {
+                reject(new Error('Query timed out'));
+            }, 120000); // 2 minute timeout
 
-                    console.log(`\n--- Query ${queryId} - Received batch ${batchCount} ---`);
-                    console.log(`Sequence: ${batchData.metadata.sequence}`);
-                    console.log(`Rows in this batch: ${batchData.rows.length}`);
-                    console.log(`Processing Time: ${batchData.metadata.processingTime} ms`);
+            const reconstructor = iotClient.streamingReconstructors.get(transferId);
+            if (!reconstructor) {
+                clearTimeout(timeout);
+                reject(new Error(`No reconstructor found for transfer ID: ${transferId}`));
+                return;
+            }
 
-                    // Print the data rows in a human-readable format
-                    console.table(batchData.rows);
-
-                    // Optional: Save each batch to a file
-                    if (SAVE_DATA === 'true') {
-                        const filename = `data_${transferId}_batch_${batchCount}.json`;
-                        fs.writeFileSync(filename, JSON.stringify(batchData.rows, null, 2));
-                        console.log(`Data saved to ${filename}`);
-                    }
-                },
-                // Completion handler
-                (error, stats) => {
-                    if (error) {
-                        console.error(`Query ${queryId} failed:`, error);
-                        reject(error); // Reject the promise on error
-                        return;
-                    }
-
-                    console.log(`\n--- Query ${queryId} completed ---`);
-                    console.log({
-                        transferId: stats.transferId,
-                        totalBatches: batchCount,
-                        totalRows: stats.totalRows,
-                        processingTime: stats.processingTime,
-                        rowsPerSecond: (stats.totalRows / (stats.processingTime / 1000)).toFixed(2)
-                    });
-
-                    resolve(); // Resolve the promise when data transfer is complete
+            reconstructor.onComplete = (error, stats) => {
+                clearTimeout(timeout);
+                if (error) {
+                    reject(error);
+                } else {
+                    resolve(stats);
                 }
-            );
+            };
         });
     } catch (error) {
         console.error(`Query ${queryId} failed:`, error);
@@ -438,25 +438,34 @@ async function performStreamingQuery(iotClient, query, queryId) {
     }
 }
 
+
 async function startSingleQuery(sqlQuery) {
     console.log(`\n--- Starting a streaming query ---`);
 
-    const iotClient = new IoTClientWrapper(); // Use the correct class name
+    const iotClient = new IoTClientWrapper();
 
     try {
         await iotClient.connect();
         console.log('Connected to IoT endpoint');
 
-        const queryId = 'single-query'; // Identifier for logging
+        // Test connection
+        await iotClient.testConnection();
+        console.log('Connection test successful');
 
-        await performStreamingQuery(iotClient, sqlQuery, queryId);
+        const queryId = 'single-query';
+        const result = await performStreamingQuery(iotClient, sqlQuery, queryId);
+        console.log('Query completed successfully:', result);
 
-        // At this point, the data transfer is complete
     } catch (error) {
         console.error('Error in single query:', error);
-        process.exit(1);
+        throw error;
     } finally {
-        await iotClient.disconnect();
+        try {
+            await iotClient.disconnect();
+            console.log('Disconnected from IoT endpoint');
+        } catch (disconnectError) {
+            console.error('Error during disconnect:', disconnectError);
+        }
     }
 }
 
