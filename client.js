@@ -48,7 +48,7 @@ const GET_DATA_QUERY = gql`
 `;
 
 class StreamingReconstructor {
-    constructor(transferId, onDataBatch, onComplete, timeoutMs = 120000) {
+    constructor(transferId, onDataBatch, onComplete, timeoutMs = 300000) {
         this.transferId = transferId;
         this.onDataBatch = onDataBatch;
         this.onComplete = onComplete;
@@ -57,26 +57,51 @@ class StreamingReconstructor {
         this.schema = null;
         this.totalRows = 0;
         this.processedSequences = new Set();
+        this.lastActivityTime = Date.now();
         this.chunkBuffers = {};
 
-        console.log(`StreamingReconstructor initialized for transfer ${transferId}`);
+        // Set up inactivity timeout
+        this.activityCheck = setInterval(() => {
+            const inactiveTime = Date.now() - this.lastActivityTime;
+            if (inactiveTime > 10000) { // 10 seconds of inactivity
+                console.log(`No activity for ${inactiveTime}ms. Processing available data.`);
+                this.processAvailableData();
+            }
+        }, 5000);
 
-        // Set up timeout
+        // Set up final timeout
         this.timeout = setTimeout(() => {
             if (!this.isFinished) {
+                clearInterval(this.activityCheck);
+                this.processAvailableData();
                 const error = new Error('Transfer timed out');
                 error.context = {
                     transferId: this.transferId,
                     processedSequences: Array.from(this.processedSequences),
                     totalRowsProcessed: this.totalRows,
-                    timeElapsed: Date.now() - this.startTime,
-                    lastProcessedSequence: Math.max(...Array.from(this.processedSequences)),
+                    timeElapsed: Date.now() - this.startTime
                 };
-                console.warn('Transfer timed out with context:', error.context);
                 this.onComplete(error);
                 this.isFinished = true;
             }
         }, timeoutMs);
+    }
+
+    processAvailableData() {
+        try {
+            // Process any complete sequences we haven't processed yet
+            for (const [sequenceNumber, bufferInfo] of Object.entries(this.chunkBuffers)) {
+                if (bufferInfo.receivedChunks === bufferInfo.totalChunks &&
+                    !this.processedSequences.has(parseInt(sequenceNumber))) {
+                    this.processCompleteSequence(parseInt(sequenceNumber), {
+                        timestamp: Date.now(),
+                        is_partial: true
+                    });
+                }
+            }
+        } catch (error) {
+            console.error('Error processing available data:', error);
+        }
     }
 
     async processMessage(message) {
@@ -377,12 +402,6 @@ async function performStreamingQuery(iotClient, query, queryId) {
         const dataReceptionPromise = new Promise((resolve, reject) => {
             const batchHandler = (batchData) => {
                 console.log(`Received batch with ${batchData.rows.length} rows for sequence ${batchData.metadata.sequence}`);
-
-                if (SAVE_DATA === 'true') {
-                    const filename = `data_${transferId}_batch_${batchData.metadata.sequence}.json`;
-                    fs.writeFileSync(filename, JSON.stringify(batchData.rows, null, 2));
-                    console.log(`Saved batch to ${filename}`);
-                }
             };
 
             const completionHandler = (error, stats) => {
@@ -402,12 +421,12 @@ async function performStreamingQuery(iotClient, query, queryId) {
         // Wait for subscription to be ready
         await new Promise(resolve => setTimeout(resolve, 1000));
 
-        // Execute GraphQL query
+        // Execute GraphQL query with required transferId
         const variables = {
             query,
             rowLimit: 100000,
             batchSize: 100,
-            transferId
+            transferId // Required field
         };
 
         console.log('Executing GraphQL query with variables:', variables);
