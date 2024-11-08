@@ -58,50 +58,43 @@ class StreamingReconstructor {
         this.totalRows = 0;
         this.processedSequences = new Set();
         this.lastActivityTime = Date.now();
-        this.chunkBuffers = {};
 
-        // Set up inactivity timeout
-        this.activityCheck = setInterval(() => {
-            const inactiveTime = Date.now() - this.lastActivityTime;
-            if (inactiveTime > 10000) { // 10 seconds of inactivity
-                console.log(`No activity for ${inactiveTime}ms. Processing available data.`);
-                this.processAvailableData();
+        // Use Map instead of object for better performance with large datasets
+        this.chunkBuffers = new Map();
+
+        // Preallocate buffer for better memory efficiency
+        this.decodingBuffer = Buffer.alloc(1024 * 1024); // 1MB initial buffer
+
+        // Batch processing optimization
+        this.batchQueue = [];
+        this.batchSize = 5000; // Process in larger batches
+        this.processingLock = false;
+
+        // More aggressive cleanup
+        this.cleanupInterval = setInterval(() => {
+            const now = Date.now();
+            for (const [seq, buffer] of this.chunkBuffers) {
+                if (now - buffer.timestamp > 10000) { // 10s timeout
+                    this.chunkBuffers.delete(seq);
+                }
             }
         }, 5000);
 
-        // Set up final timeout
+        // Faster activity checking
+        this.activityCheck = setInterval(() => {
+            const inactiveTime = Date.now() - this.lastActivityTime;
+            if (inactiveTime > 2000) { // Reduced to 2s
+                this.processAvailableData();
+            }
+        }, 1000);
+
+        // Set timeout
         this.timeout = setTimeout(() => {
             if (!this.isFinished) {
-                clearInterval(this.activityCheck);
                 this.processAvailableData();
-                const error = new Error('Transfer timed out');
-                error.context = {
-                    transferId: this.transferId,
-                    processedSequences: Array.from(this.processedSequences),
-                    totalRowsProcessed: this.totalRows,
-                    timeElapsed: Date.now() - this.startTime
-                };
-                this.onComplete(error);
-                this.isFinished = true;
+                setTimeout(() => this.complete(), 2000);
             }
-        }, timeoutMs);
-    }
-
-    processAvailableData() {
-        try {
-            // Process any complete sequences we haven't processed yet
-            for (const [sequenceNumber, bufferInfo] of Object.entries(this.chunkBuffers)) {
-                if (bufferInfo.receivedChunks === bufferInfo.totalChunks &&
-                    !this.processedSequences.has(parseInt(sequenceNumber))) {
-                    this.processCompleteSequence(parseInt(sequenceNumber), {
-                        timestamp: Date.now(),
-                        is_partial: true
-                    });
-                }
-            }
-        } catch (error) {
-            console.error('Error processing available data:', error);
-        }
+        }, timeoutMs - 2000);
     }
 
     async processMessage(message) {
@@ -109,78 +102,100 @@ class StreamingReconstructor {
 
         try {
             const { metadata, data, type } = message;
-            console.log(`Processing message for sequence ${metadata.sequence_number}, chunk ${metadata.chunk_number}/${metadata.total_chunks} (is_final_sequence: ${metadata.is_final_sequence})`);
+            this.lastActivityTime = Date.now();
 
-            if (type !== 'arrow_data') {
-                console.warn(`Unexpected message type: ${type}`);
-                return false;
-            }
+            if (type !== 'arrow_data') return false;
 
             const sequenceNumber = metadata.sequence_number;
             const chunkNumber = metadata.chunk_number;
             const totalChunks = metadata.total_chunks;
 
-            // Initialize storage for this sequence if needed
-            if (!this.chunkBuffers[sequenceNumber]) {
-                this.chunkBuffers[sequenceNumber] = {
+            // Use Map for better performance
+            if (!this.chunkBuffers.has(sequenceNumber)) {
+                this.chunkBuffers.set(sequenceNumber, {
                     chunks: new Array(totalChunks),
                     totalChunks,
                     receivedChunks: 0,
-                };
+                    timestamp: Date.now()
+                });
             }
 
-            const bufferInfo = this.chunkBuffers[sequenceNumber];
+            const bufferInfo = this.chunkBuffers.get(sequenceNumber);
 
-            // Store the chunk if we haven't stored it before
+            // Store chunk data
             if (!bufferInfo.chunks[chunkNumber - 1]) {
                 bufferInfo.chunks[chunkNumber - 1] = data;
                 bufferInfo.receivedChunks++;
-                console.log(`Stored chunk ${chunkNumber}/${totalChunks} for sequence ${sequenceNumber}`);
-            }
 
-            // Process the sequence if all chunks are received
-            if (bufferInfo.receivedChunks === bufferInfo.totalChunks &&
-                !this.processedSequences.has(sequenceNumber)) {
+                // Process immediately if sequence is complete
+                if (bufferInfo.receivedChunks === bufferInfo.totalChunks) {
+                    this.batchQueue.push({ sequenceNumber, metadata });
 
-                console.log(`Processing complete sequence ${sequenceNumber}`);
-                await this.processCompleteSequence(sequenceNumber, metadata);
+                    // Process batch if queue is full
+                    if (this.batchQueue.length >= 10) {
+                        await this.processBatchQueue();
+                    }
 
-                // Clean up the processed sequence
-                delete this.chunkBuffers[sequenceNumber];
-                this.processedSequences.add(sequenceNumber);
-
-                // If this was the final sequence, complete the transfer
-                if (metadata.is_final_sequence === true) {
-                    console.log('Final sequence detected, completing transfer');
-                    await this.complete();
-                    return true;
+                    if (metadata.is_final_sequence === true) {
+                        await this.processBatchQueue();
+                        await this.complete();
+                        return true;
+                    }
                 }
             }
 
             return false;
         } catch (error) {
             console.error('Error processing message:', error);
-            console.error('Message:', JSON.stringify(message, null, 2));
-            this.onComplete(error);
-            return false;
+            throw error;
+        }
+    }
+
+    async processBatchQueue() {
+        if (this.processingLock || this.batchQueue.length === 0) return;
+
+        this.processingLock = true;
+        const batchesToProcess = this.batchQueue.splice(0, 10); // Process up to 10 sequences at once
+
+        try {
+            await Promise.all(batchesToProcess.map(async ({ sequenceNumber, metadata }) => {
+                await this.processCompleteSequence(sequenceNumber, metadata);
+                this.chunkBuffers.delete(sequenceNumber);
+                this.processedSequences.add(sequenceNumber);
+            }));
+        } finally {
+            this.processingLock = false;
         }
     }
 
     async processCompleteSequence(sequenceNumber, metadata) {
-        const bufferInfo = this.chunkBuffers[sequenceNumber];
+        const bufferInfo = this.chunkBuffers.get(sequenceNumber);
+        if (!bufferInfo) return;
+
         const completeData = bufferInfo.chunks.join('');
-        const buffer = Buffer.from(completeData, 'base64');
+        if (!completeData) return;
+
+        // Optimize buffer handling
+        const compressedBuffer = Buffer.from(completeData, 'base64');
+
+        // Use streaming decompression for better memory usage
+        const pako = require('pako');
+        const inflate = new pako.Inflate();
 
         try {
-            const reader = await RecordBatchStreamReader.from(buffer);
-            const batches = await reader.readAll();
+            inflate.push(compressedBuffer, true);
+            if (inflate.err) throw new Error(inflate.msg);
 
-            if (!this.schema && batches.length > 0) {
-                this.schema = batches[0].schema;
-            }
+            const decompressedBuffer = Buffer.from(inflate.result);
 
-            for (const batch of batches) {
-                const rows = batch.toArray();
+            // Process Arrow data in streaming fashion
+            const reader = await RecordBatchStreamReader.from(decompressedBuffer);
+
+            while (true) {
+                const batch = await reader.next();
+                if (batch.done) break;
+
+                const rows = batch.value.toArray();
                 this.totalRows += rows.length;
 
                 this.onDataBatch({
@@ -188,38 +203,45 @@ class StreamingReconstructor {
                     metadata: {
                         sequence: sequenceNumber,
                         timestamp: metadata.timestamp,
-                        processingTime: Date.now() - this.startTime
+                        processingTime: Date.now() - this.startTime,
+                        is_partial: false
                     }
                 });
             }
-
-            console.log(`Processed ${batches.length} batches from sequence ${sequenceNumber}`);
         } catch (error) {
-            console.error('Error processing Arrow data:', error);
-            console.error('Buffer info:', bufferInfo);
+            console.error(`Error processing sequence ${sequenceNumber}:`, error);
             throw error;
         }
+    }
+
+    async processAvailableData() {
+        if (this.processingLock) return;
+        await this.processBatchQueue();
     }
 
     async complete() {
         if (this.isFinished) return;
 
-        this.isFinished = true;
         clearTimeout(this.timeout);
+        clearInterval(this.activityCheck);
+        clearInterval(this.cleanupInterval);
 
-        const processingTime = Date.now() - this.startTime;
-        console.log(`Transfer completed. Processed ${this.totalRows} rows in ${processingTime}ms`);
+        // Process any remaining data
+        await this.processBatchQueue();
 
-        this.onComplete(null, {
+        const stats = {
             transferId: this.transferId,
             totalRows: this.totalRows,
-            processingTime,
+            processingTime: Date.now() - this.startTime,
             processedSequences: Array.from(this.processedSequences),
             schema: this.schema?.fields.map(f => ({
                 name: f.name,
                 type: f.type.toString()
             }))
-        });
+        };
+
+        this.isFinished = true;
+        this.onComplete(null, stats);
     }
 }
 
@@ -393,67 +415,165 @@ class IoTClientWrapper {
     }
 }
 
-async function performStreamingQuery(iotClient, query, queryId) {
+async function performPaginatedStreamingQuery(iotClient, query, queryId, options = {}) {
+    const {
+        pageSize = 50000,    // Size of each page
+        maxPages = 20,       // Maximum number of pages to attempt
+        maxRows = 1000000,   // Hard limit of 1M rows
+        pageTimeout = 120000,
+        concurrentPages = 2
+    } = options;
+
+    const results = {
+        totalRows: 0,
+        processedPages: 0,
+        errors: [],
+        stats: new Map(),  // Use Map to ensure unique page entries
+        completedPages: new Set()  // Track completed pages
+    };
+
     try {
-        const transferId = uuidv4();
-        console.log(`Starting query execution with transfer ID: ${transferId}`);
+        const baseQuery = query.replace(/\\n/g, ' ').trim();
+        const semaphore = new Set();
+        let currentOffset = 0;
+        let hasMore = true;
+        let pageNumber = 0;
 
-        // Set up data reception promise
-        const dataReceptionPromise = new Promise((resolve, reject) => {
-            const batchHandler = (batchData) => {
-                console.log(`Received batch with ${batchData.rows.length} rows for sequence ${batchData.metadata.sequence}`);
-            };
+        while (hasMore &&
+        pageNumber < maxPages &&
+        results.totalRows < maxRows) {
 
-            const completionHandler = (error, stats) => {
-                if (error) {
-                    console.error(`Transfer failed:`, error);
-                    reject(error);
-                } else {
-                    console.log(`Transfer completed:`, stats);
-                    resolve(stats);
-                }
-            };
-
-            iotClient.subscribe(transferId, batchHandler, completionHandler)
-                .catch(reject);
-        });
-
-        // Wait for subscription to be ready
-        await new Promise(resolve => setTimeout(resolve, 1000));
-
-        // Execute GraphQL query with required transferId
-        const variables = {
-            query,
-            rowLimit: 100000,
-            batchSize: 100,
-            transferId // Required field
-        };
-
-        console.log('Executing GraphQL query with variables:', variables);
-
-        const response = await axios.post(
-            APP_SYNC_API_URL,
-            {
-                query: print(GET_DATA_QUERY),
-                variables
-            },
-            {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-api-key': APP_SYNC_API_KEY,
-                },
+            while (semaphore.size >= concurrentPages) {
+                await new Promise(resolve => setTimeout(resolve, 100));
             }
-        );
 
-        if (response.data.errors) {
-            throw new Error(`GraphQL query failed: ${JSON.stringify(response.data.errors)}`);
+            const offset = currentOffset;
+            const endOffset = Math.min(offset + pageSize, maxRows);  // Respect maxRows
+
+            // Create the pagination query
+            const paginatedQuery = `
+                WITH numbered_rows AS (
+                    SELECT ROW_NUMBER() OVER () as row_num, t.*
+                    FROM (${baseQuery}) t
+                )
+                SELECT *
+                FROM numbered_rows 
+                WHERE row_num > ${offset} AND row_num <= ${endOffset}`;
+
+            console.log(`Processing page ${pageNumber}: ${offset} to ${endOffset} (Total rows so far: ${results.totalRows})`);
+
+            const pagePromise = (async () => {
+                try {
+                    const transferId = `${queryId}-page-${pageNumber}`;
+                    let pageRows = 0;
+
+                    const dataReceptionPromise = new Promise((resolve, reject) => {
+                        const batchHandler = (batchData) => {
+                            if (!results.completedPages.has(pageNumber)) {
+                                pageRows += batchData.rows.length;
+
+                                // Update running total, respecting maxRows
+                                const newTotal = Math.min(results.totalRows + pageRows, maxRows);
+                                if (newTotal >= maxRows) {
+                                    hasMore = false;
+                                }
+                            }
+                        };
+
+                        const completionHandler = (error, stats) => {
+                            if (error) {
+                                reject(error);
+                            } else {
+                                if (!results.completedPages.has(pageNumber)) {
+                                    results.completedPages.add(pageNumber);
+                                    results.totalRows = Math.min(results.totalRows + pageRows, maxRows);
+                                    results.stats.set(pageNumber, {
+                                        page: pageNumber,
+                                        offset,
+                                        endOffset,
+                                        rows: pageRows,
+                                        status: 'COMPLETED'
+                                    });
+                                }
+                                resolve({ rows: pageRows, status: 'COMPLETED', stats });
+                            }
+                        };
+
+                        iotClient.subscribe(transferId, batchHandler, completionHandler)
+                            .catch(reject);
+                    });
+
+                    const timeoutPromise = new Promise((_, reject) => {
+                        setTimeout(() => {
+                            reject(new Error(`Page ${pageNumber} timed out`));
+                        }, pageTimeout);
+                    });
+
+                    await new Promise(resolve => setTimeout(resolve, 500));
+
+                    const response = await axios.post(
+                        APP_SYNC_API_URL,
+                        {
+                            query: print(GET_DATA_QUERY),
+                            variables: {
+                                query: paginatedQuery,
+                                rowLimit: pageSize,
+                                batchSize: 1000,
+                                transferId
+                            }
+                        },
+                        {
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'x-api-key': APP_SYNC_API_KEY,
+                            },
+                        }
+                    );
+
+                    if (response.data.errors) {
+                        throw new Error(`GraphQL query failed: ${JSON.stringify(response.data.errors)}`);
+                    }
+
+                    const result = await Promise.race([
+                        dataReceptionPromise,
+                        timeoutPromise
+                    ]);
+
+                    results.processedPages++;
+
+                    // Stop if we got fewer rows than expected
+                    if (result.rows < pageSize || results.totalRows >= maxRows) {
+                        hasMore = false;
+                        console.log(`End of data reached at ${results.totalRows} total rows`);
+                    }
+
+                    return result;
+
+                } catch (error) {
+                    results.errors.push({
+                        page: pageNumber,
+                        error: error.message
+                    });
+                    throw error;
+                } finally {
+                    semaphore.delete(pagePromise);
+                }
+            })();
+
+            semaphore.add(pagePromise);
+            currentOffset += pageSize;
+            pageNumber++;
+
+            await new Promise(resolve => setTimeout(resolve, 500));
         }
 
-        console.log('Query initiated successfully, waiting for data...');
+        await Promise.all([...semaphore]);
 
-        // Wait for data reception to complete
-        const result = await dataReceptionPromise;
-        return result;
+        console.log(`Query completed with ${results.totalRows} total rows across ${results.processedPages} pages`);
+        return {
+            ...results,
+            stats: Array.from(results.stats.values())  // Convert Map to Array for output
+        };
 
     } catch (error) {
         console.error(`Query ${queryId} failed:`, error);
@@ -461,8 +581,8 @@ async function performStreamingQuery(iotClient, query, queryId) {
     }
 }
 
-async function startSingleQuery(sqlQuery) {
-    console.log(`\n--- Starting streaming query ---`);
+async function startSingleQuery(sqlQuery, options = {}) {
+    console.log(`\n--- Starting paginated streaming query ---`);
     const iotClient = new IoTClientWrapper();
 
     try {
@@ -473,8 +593,45 @@ async function startSingleQuery(sqlQuery) {
         console.log('Connection test successful');
 
         const queryId = 'single-query';
-        const result = await performStreamingQuery(iotClient, sqlQuery, queryId);
-        console.log(`Query completed successfully:`, result);
+
+        // Set up pagination options with defaults
+        const queryOptions = {
+            pageSize: options.pageSize || 50000,        // Rows per page
+            maxRows: options.maxRows || 1000000,        // Total maximum rows to process
+            maxPages: options.maxPages || 20,           // Maximum number of pages to attempt
+            pageTimeout: options.pageTimeout || 120000, // Timeout per page (2 minutes)
+            concurrentPages: options.concurrentPages || 2 // Number of concurrent page requests
+        };
+
+        console.log('Query options:', {
+            ...queryOptions,
+            query: sqlQuery.slice(0, 100) + '...' // Show truncated query for logging
+        });
+
+        const result = await performPaginatedStreamingQuery(
+            iotClient,
+            sqlQuery,
+            queryId,
+            queryOptions
+        );
+
+        console.log('\nQuery Results:');
+        console.log(`Total rows processed: ${result.totalRows}`);
+        console.log(`Pages processed: ${result.processedPages}`);
+        console.log(`Average rows per page: ${Math.round(result.totalRows / result.processedPages)}`);
+
+        if (result.stats.length > 0) {
+            console.log('\nPage Statistics:');
+            result.stats.forEach(stat => {
+                console.log(`Page ${stat.page}: ${stat.rows} rows (${stat.offset} → ${stat.endOffset}) [${stat.status}]`);
+            });
+        }
+
+        if (result.errors.length > 0) {
+            console.log('\nErrors encountered:', result.errors);
+        }
+
+        return result;
 
     } catch (error) {
         console.error('Error in query execution:', error);
@@ -489,18 +646,42 @@ async function startSingleQuery(sqlQuery) {
     }
 }
 
+// Usage examples:
 (async () => {
     console.log('--- Streaming Lambda Tester ---');
     console.log(`AppSync API URL: ${APP_SYNC_API_URL}`);
     console.log(`SQL Query: ${SQL_QUERY}`);
-    console.log(`Save Data: ${SAVE_DATA === 'true' ? 'Enabled' : 'Disabled'}\n`);
 
     try {
-        await startSingleQuery(SQL_QUERY);
+        // Basic usage with defaults
+        // await startSingleQuery(SQL_QUERY);
+
+        // Configuration for large dataset
+        await startSingleQuery(SQL_QUERY, {
+            pageSize: 100000,      // 100k rows per page
+            maxRows: 1000000,      // Up to 1M total rows
+            maxPages: 50,          // Up to 50 pages
+            concurrentPages: 4,    // Process 4 pages at once
+            pageTimeout: 180000    // 3 minutes per page
+        });
+
+        // small batch configuration
+        // await startSingleQuery(SQL_QUERY, {
+        //     pageSize: 10000,       // 10k rows per page
+        //     maxRows: 100000,       // Up to 100k total rows
+        //     maxPages: 10,          // Up to 10 pages
+        //     concurrentPages: 2,    // Process 2 pages at once
+        //     pageTimeout: 60000     // 1 minute per page
+        // });
+
         console.log('\n--- Testing Completed Successfully ---');
         process.exit(0);
     } catch (error) {
-        console.error('Testing failed:', error);
+        if (error.context && error.context.processingStatus === "TIMEOUT") {
+            console.log("Query timed out but processed data:", error.context);
+        } else {
+            console.error("Query failed:", error);
+        }
         process.exit(1);
     }
 })();
